@@ -1,0 +1,116 @@
+#!/bin/bash
+# ==============================================================================
+# SECURITY SETTINGS (CHANGE THESE!) / НАСТРОЙКИ БЕЗОПАСНОСТИ (ИЗМЕНИ ПОД СЕБЯ!)
+# ==============================================================================
+NEW_USER="cooladmin"         # Имя нового админа / New admin username
+USER_PASSWORD="SuperPassword123!" # Пароль для SUDO нового админа / PASSWORD FOR SUDO ACCESS
+SSH_PORT="2222"              # Новый порт для SSH / New SSH port
+SSH_PUBLIC_KEY="here"        # Вставь свой публичный SSH-ключ / Paste your public SSH key here
+TRUSTED_IP=""                # Твой статический IP (если есть) / Your static IP (optional)
+
+# Check for root privileges / Проверка прав root
+if [ "$EUID" -ne 0 ]; then
+    echo "Error: Please run this script as root (using sudo)!"
+    exit 1
+fi
+
+echo "=== Starting automated basic security setup... ==="
+
+# 1. Update system packages / Обновление пакетов системы
+echo "--> Updating the system..."
+export DEBIAN_FRONTEND=noninteractive
+apt update && apt upgrade -y
+
+# 2. Create a secure user / Создание безопасного пользователя
+echo "--> Creating user: $NEW_USER..."
+if id "$NEW_USER" &>/dev/null; then
+    echo "User $NEW_USER already exists. Skipping creation. / Пользователь уже существует. Пропускаем."
+else
+    # Шифруем текстовый пароль в SHA-512 хэш / Encrypt plain text password to SHA-512 hash
+    ENCRYPTED_PASSWORD=$(openssl passwd -6 "$USER_PASSWORD")
+    
+    # Создаем пользователя сразу с паролем / Create user with password pre-set
+    useradd -m -s /bin/bash -p "$ENCRYPTED_PASSWORD" "$NEW_USER"
+    echo "User $NEW_USER created successfully. / Пользователь успешно создан."
+fi
+
+# Добавляем в группу sudo / Add to sudo group
+usermod -aG sudo "$NEW_USER"
+
+# 3. Setup SSH key for the new user / Добавление SSH-ключа новому пользователю
+echo "--> Adding SSH public key..."
+USER_HOME=$(getent passwd "$NEW_USER" | cut -d: -f6)
+
+if [ -z "$USER_HOME" ]; then
+    echo "Error: Could not find home directory for $NEW_USER"
+    exit 1
+fi
+
+mkdir -p "$USER_HOME/.ssh"
+echo "$SSH_PUBLIC_KEY" > "$USER_HOME/.ssh/authorized_keys"
+chown -R "$NEW_USER:$NEW_USER" "$USER_HOME/.ssh"
+chmod 700 "$USER_HOME/.ssh"
+chmod 600 "$USER_HOME/.ssh/authorized_keys"
+
+# 4. Configure SSH Daemon / Настройка SSH-демона
+echo "--> Hardening SSH config (changing port, disabling root and passwords)..."
+mkdir -p /etc/ssh/sshd_config.d
+cat <<EOF > /etc/ssh/sshd_config.d/99-hardened.conf
+Port $SSH_PORT
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+EOF
+chmod 600 /etc/ssh/sshd_config.d/99-hardened.conf
+
+# 5. Configure Firewall (UFW) / Настройка фаервола (UFW)
+echo "--> Setting up UFW firewall..."
+apt install ufw -y
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow "$SSH_PORT"/tcp comment 'Custom SSH Port'
+echo "y" | ufw enable
+
+# 6. Install and configure Fail2Ban / Установка и настройка Fail2Ban
+echo "--> Installing Fail2Ban against brute-force attacks..."
+apt install fail2ban -y
+
+IGNORE_LIST="127.0.0.1/8 ::1"
+if [ -n "$TRUSTED_IP" ]; then
+    IGNORE_LIST="$IGNORE_LIST $TRUSTED_IP"
+fi
+
+# Настройка под современные OS / Configuration for modern OS
+cat <<EOT > /etc/fail2ban/jail.local
+[sshd]
+enabled = true
+port = $SSH_PORT
+backend = systemd
+maxretry = 3
+bantime = 1h
+ignoreip = $IGNORE_LIST
+EOT
+
+# Restarting services / Перезапуск сервисов
+echo "--> Restarting SSH and Fail2Ban services..."
+systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
+systemctl enable fail2ban &>/dev/null
+systemctl restart fail2ban
+
+# Вывод финального статуса настройки / Output final status
+echo "======================================================"
+echo " Done! Basic security configuration applied successfully."
+echo " SSH PORT: $SSH_PORT"
+echo " USERNAME: $NEW_USER"
+echo " PASSWORD for sudo: (The one you set in USER_PASSWORD variable) / (Тот, что вы указали в переменной USER_PASSWORD)"
+echo " Root login and password authentication are now DISABLED."
+echo "======================================================"
+echo "IMPORTANT: Do NOT close this terminal window yet!"
+echo "ВАЖНО: Не закрывайте это окно терминала!"
+echo "Open a NEW terminal window on your PC and test the connection:"
+echo "Откройте НОВОЕ окно терминала на ПК и проверьте подключение:"
+echo "ssh -p $SSH_PORT $NEW_USER@YOUR_SERVER_IP"
+echo "======================================================"
+
+# Clearing command history to wipe the password from logs / Очистка истории команд для удаления пароля из логов
+history -c && history -w
